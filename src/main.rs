@@ -1,9 +1,9 @@
 use prompt::{puzzle, welcome};
 
-use halo2_proofs::arithmetic::PrimeField;
+use halo2_proofs::arithmetic::{lagrange_interpolate, eval_polynomial, PrimeField};
 use halo2_proofs::circuit::{Layouter, SimpleFloorPlanner, Value};
 use halo2_proofs::plonk::{
-    create_proof as create_plonk_proof, keygen_pk, keygen_vk, verify_proof as verify_plonk_proof,
+    create_proof as create_plonk_proof, keygen_pk, keygen_vk, verify_proof as verify_plonk_proof, verify_proof2 as verify_plonk_proof2,
     Advice, Circuit, Column, ConstraintSystem, Error, Fixed, ProvingKey,
     VerifyingKey, Instance
 };
@@ -401,6 +401,42 @@ pub fn verify_proof<
     assert!(strategy.finalize());
 }
 
+pub fn verify_proof2<
+    'a,
+    'params,
+    Scheme: CommitmentScheme<Scalar = halo2curves::bn256::Fr>,
+    V: Verifier<'params, Scheme>,
+    E: EncodedChallenge<Scheme::Curve>,
+    T: TranscriptReadBuffer<&'a [u8], Scheme::Curve, E>,
+    Strategy: VerificationStrategy<'params, Scheme, V, Output = Strategy>,
+>(
+    params_verifier: &'params Scheme::ParamsVerifier,
+    vk: &VerifyingKey<Scheme::Curve>,
+    proof: &'a [u8],
+    nullifier: Fr,
+    commitment: Fr,
+)-> (Fr, Fr) where
+    Scheme::Scalar: Ord + WithSmallOrderMulGroup<3> + FromUniformBytes<64>,
+{
+    let pubinputs = vec![nullifier, commitment];
+
+    let mut transcript = T::init(proof);
+
+    let strategy = Strategy::new(params_verifier);
+    let (x, eval): (Fr, Fr) = verify_plonk_proof2(
+        params_verifier,
+        vk,
+        strategy,
+        &[&[&pubinputs[..]]],
+        &mut transcript,
+    ).unwrap();
+    return (x, eval);
+    // let x: ChallengeX<_> = transcript.squeeze_challenge_scalar();
+    // let advice_evals = (0..num_proofs)
+    // .map(|_| -> Result<Vec<_>, _> { read_n_scalars(transcript, vk.cs.advice_queries.len()) })
+    // .collect::<Result<Vec<_>, _>>()?;
+}
+
 pub fn shplonk() -> (Vec<u8>, Fr, Fr) {
     use halo2_proofs::poly::kzg::commitment::{KZGCommitmentScheme, ParamsKZG};
     use halo2_proofs::poly::kzg::multiopen::{ProverSHPLONK, VerifierSHPLONK};
@@ -410,7 +446,7 @@ pub fn shplonk() -> (Vec<u8>, Fr, Fr) {
     use rand_core::SeedableRng;
 
     let setup_rng = ChaCha20Rng::from_seed([1u8; 32]);
-    let params = ParamsKZG::<Bn256>::setup(K, setup_rng);
+    let params: ParamsKZG<Bn256> = ParamsKZG::<Bn256>::setup(K, setup_rng);
     let rng = OsRng;
 
     let pk = keygen::<KZGCommitmentScheme<_>>(&params);
@@ -474,6 +510,40 @@ fn from_serialized(i: usize) -> (Vec<u8>, Fr, Fr) {
     (proof, nullifier, commitment)
 }
 
+fn from_serialized2(i: usize) -> (Fr, Fr) {
+    use halo2_proofs::poly::kzg::commitment::{KZGCommitmentScheme, ParamsKZG};
+    use halo2_proofs::poly::kzg::multiopen::VerifierSHPLONK;
+    use halo2_proofs::poly::kzg::strategy::AccumulatorStrategy;
+    use halo2curves::bn256::Bn256;
+
+    let setup_rng = ChaCha20Rng::from_seed([1u8; 32]);
+    let params = ParamsKZG::<Bn256>::setup(K, setup_rng);
+
+    let pk = keygen::<KZGCommitmentScheme<_>>(&params);
+
+    let (proofs, nullifiers, commitments) = deserialize();
+
+    let proof = proofs[i].clone();
+    let nullifier = nullifiers[i];
+    let commitment = commitments[i];
+
+    let verifier_params = params.verifier_params();
+    let (x , eval) = verify_proof2::<
+        _,
+        VerifierSHPLONK<_>,
+        _,
+        Blake2bRead<_, _, Challenge255<_>>,
+        AccumulatorStrategy<_>,
+    >(
+        verifier_params,
+        pk.get_vk(),
+        &proof[..],
+        nullifier,
+        commitment,
+    );
+    return (x, eval);
+}
+
 use std::fs::File;
 use std::io::Write;
 
@@ -522,8 +592,9 @@ pub fn deserialize() -> (Vec<Vec<u8>>, Vec<Fr>, Vec<Fr>) {
         let mut file = File::open(&filename).unwrap();
         let mut cm_bytes: Vec<u8> = Vec::new();
         file.read_to_end(&mut cm_bytes).unwrap();
-
+        // println!("{:?}", cm_bytes);
         let commitment: Fr = Fr::from_repr(cm_bytes.try_into().unwrap()).unwrap();
+        // println!("{:?}", commitment);
 
         nullifiers.push(nullifier);
         commitments.push(commitment);
@@ -540,8 +611,20 @@ pub fn main() {
     // serialize();
 
     /* Implement your attack here, to find the index of the encrypted message */
+    // solution implement lagrange interpolation for 64 points and evaluations,
 
-    let secret = Fr::from(0u64);
+    let mut points: Vec<_> = vec![];
+    let mut evals: Vec<_> = vec![];
+    for i in 0..64 {
+        let (x, eval) = from_serialized2(i);
+        points.push(x);
+        evals.push(eval);
+    }
+    let poly = lagrange_interpolate(&points, &evals);
+    let w = Fr::from_str_vartime("12799441450189702121232122059226990287081568291547011007819741462284200902087").unwrap();
+
+    let secret = eval_polynomial(&poly, w.square());
+    println!("secret {:?}", secret);
     let secret_commitment = poseidon_base::primitives::Hash::<
         _,
         P128Pow5T3Compact<Fr>,
