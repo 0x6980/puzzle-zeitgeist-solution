@@ -3,7 +3,7 @@ use prompt::{puzzle, welcome};
 use halo2_proofs::arithmetic::{lagrange_interpolate, eval_polynomial, PrimeField};
 use halo2_proofs::circuit::{Layouter, SimpleFloorPlanner, Value};
 use halo2_proofs::plonk::{
-    create_proof as create_plonk_proof, keygen_pk, keygen_vk, verify_proof as verify_plonk_proof, verify_proof2 as verify_plonk_proof2,
+    create_proof as create_plonk_proof, keygen_pk, keygen_vk, verify_proof as verify_plonk_proof, get_x_eval_plonk,
     Advice, Circuit, Column, ConstraintSystem, Error, Fixed, ProvingKey,
     VerifyingKey, Instance
 };
@@ -401,42 +401,6 @@ pub fn verify_proof<
     assert!(strategy.finalize());
 }
 
-pub fn verify_proof2<
-    'a,
-    'params,
-    Scheme: CommitmentScheme<Scalar = halo2curves::bn256::Fr>,
-    V: Verifier<'params, Scheme>,
-    E: EncodedChallenge<Scheme::Curve>,
-    T: TranscriptReadBuffer<&'a [u8], Scheme::Curve, E>,
-    Strategy: VerificationStrategy<'params, Scheme, V, Output = Strategy>,
->(
-    params_verifier: &'params Scheme::ParamsVerifier,
-    vk: &VerifyingKey<Scheme::Curve>,
-    proof: &'a [u8],
-    nullifier: Fr,
-    commitment: Fr,
-)-> (Fr, Fr) where
-    Scheme::Scalar: Ord + WithSmallOrderMulGroup<3> + FromUniformBytes<64>,
-{
-    let pubinputs = vec![nullifier, commitment];
-
-    let mut transcript = T::init(proof);
-
-    let strategy = Strategy::new(params_verifier);
-    let (x, eval): (Fr, Fr) = verify_plonk_proof2(
-        params_verifier,
-        vk,
-        strategy,
-        &[&[&pubinputs[..]]],
-        &mut transcript,
-    ).unwrap();
-    return (x, eval);
-    // let x: ChallengeX<_> = transcript.squeeze_challenge_scalar();
-    // let advice_evals = (0..num_proofs)
-    // .map(|_| -> Result<Vec<_>, _> { read_n_scalars(transcript, vk.cs.advice_queries.len()) })
-    // .collect::<Result<Vec<_>, _>>()?;
-}
-
 pub fn shplonk() -> (Vec<u8>, Fr, Fr) {
     use halo2_proofs::poly::kzg::commitment::{KZGCommitmentScheme, ParamsKZG};
     use halo2_proofs::poly::kzg::multiopen::{ProverSHPLONK, VerifierSHPLONK};
@@ -510,7 +474,18 @@ fn from_serialized(i: usize) -> (Vec<u8>, Fr, Fr) {
     (proof, nullifier, commitment)
 }
 
-fn from_serialized2(i: usize) -> (Fr, Fr) {
+fn gen_pk() -> ProvingKey<halo2curves::bn256::G1Affine> {
+    use halo2_proofs::poly::kzg::commitment::{KZGCommitmentScheme, ParamsKZG};
+    use halo2curves::bn256::Bn256;
+
+    let setup_rng = ChaCha20Rng::from_seed([1u8; 32]);
+    let params = ParamsKZG::<Bn256>::setup(K, setup_rng);
+
+    let pk  = keygen::<KZGCommitmentScheme<_>>(&params);
+    return pk;
+}
+
+fn get_x_eval(i: usize) -> (Fr, Fr) {
     use halo2_proofs::poly::kzg::commitment::{KZGCommitmentScheme, ParamsKZG};
     use halo2_proofs::poly::kzg::multiopen::VerifierSHPLONK;
     use halo2_proofs::poly::kzg::strategy::AccumulatorStrategy;
@@ -519,7 +494,7 @@ fn from_serialized2(i: usize) -> (Fr, Fr) {
     let setup_rng = ChaCha20Rng::from_seed([1u8; 32]);
     let params = ParamsKZG::<Bn256>::setup(K, setup_rng);
 
-    let pk = keygen::<KZGCommitmentScheme<_>>(&params);
+    let pk  = keygen::<KZGCommitmentScheme<_>>(&params);
 
     let (proofs, nullifiers, commitments) = deserialize();
 
@@ -528,7 +503,7 @@ fn from_serialized2(i: usize) -> (Fr, Fr) {
     let commitment = commitments[i];
 
     let verifier_params = params.verifier_params();
-    let (x , eval) = verify_proof2::<
+    let (x , eval) = get_x_eval_in_verify::<
         _,
         VerifierSHPLONK<_>,
         _,
@@ -541,6 +516,38 @@ fn from_serialized2(i: usize) -> (Fr, Fr) {
         nullifier,
         commitment,
     );
+    return (x, eval);
+}
+
+pub fn get_x_eval_in_verify<
+    'a,
+    'params,
+    Scheme: CommitmentScheme<Scalar = halo2curves::bn256::Fr>,
+    V: Verifier<'params, Scheme>,
+    E: EncodedChallenge<Scheme::Curve>,
+    T: TranscriptReadBuffer<&'a [u8], Scheme::Curve, E>,
+    Strategy: VerificationStrategy<'params, Scheme, V, Output = Strategy>,
+>(
+    params_verifier: &'params Scheme::ParamsVerifier,
+    vk: &VerifyingKey<Scheme::Curve>,
+    proof: &'a [u8],
+    nullifier: Fr,
+    commitment: Fr,
+)-> (Fr, Fr) where
+    Scheme::Scalar: Ord + WithSmallOrderMulGroup<3> + FromUniformBytes<64>,
+{
+    let pubinputs = vec![nullifier, commitment];
+
+    let mut transcript = T::init(proof);
+
+    let strategy = Strategy::new(params_verifier);
+    let (x, eval): (Fr, Fr) = get_x_eval_plonk(
+        params_verifier,
+        vk,
+        strategy,
+        &[&[&pubinputs[..]]],
+        &mut transcript,
+    ).unwrap();
     return (x, eval);
 }
 
@@ -616,27 +623,40 @@ pub fn main() {
     let mut points: Vec<_> = vec![];
     let mut evals: Vec<_> = vec![];
     for i in 0..64 {
-        let (x, eval) = from_serialized2(i);
+        let (x, eval) = get_x_eval(i);
         points.push(x);
         evals.push(eval);
     }
     let poly = lagrange_interpolate(&points, &evals);
-    let w = Fr::from_str_vartime("12799441450189702121232122059226990287081568291547011007819741462284200902087").unwrap();
 
-    let secret = eval_polynomial(&poly, w.square());
-    println!("secret {:?}", secret);
-    let secret_commitment = poseidon_base::primitives::Hash::<
-        _,
-        P128Pow5T3Compact<Fr>,
-        ConstantLength<2>,
-        WIDTH,
-        RATE,
-    >::init()
-    .hash([secret, Fr::from(0u64)]);
-    for i in 0..64 {
-        let (_, _, commitment) = from_serialized(i);
-        assert_eq!(secret_commitment, commitment);
+    let pk = gen_pk();
+    let omega = pk.get_vk().get_domain().get_omega(); // Fr::from_str_vartime("12799441450189702121232122059226990287081568291547011007819741462284200902087").unwrap();
+    let mut point = Fr::one();
+
+    'outer: for j in 1..64 {
+        point = point.mul(&omega);
+
+        let secret = eval_polynomial(&poly, point);
+        let secret_commitment = poseidon_base::primitives::Hash::<
+            _,
+            P128Pow5T3Compact<Fr>,
+            ConstantLength<2>,
+            WIDTH,
+            RATE,
+        >::init()
+        .hash([secret, Fr::from(0u64)]);
+        'inner: for i in 0..64 {
+            let (_, _, commitment) = from_serialized(i);
+            if secret_commitment != commitment {
+                break 'inner;
+            }
+            println!("secret {:?}", secret);
+            println!("power of omega j = {:?}", j);
+            println!("point or omega_j {:?}", point);
+            break 'outer;
+        }
     }
+    
     /* End of attack */
 }
 

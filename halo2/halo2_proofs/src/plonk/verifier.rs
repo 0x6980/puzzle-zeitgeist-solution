@@ -441,7 +441,7 @@ where
     })
 }
 
-pub fn verify_proof2<
+pub fn get_x_eval_plonk<
     'params,
     Scheme: CommitmentScheme,
     V: Verifier<'params, Scheme>,
@@ -458,6 +458,12 @@ pub fn verify_proof2<
 where
     Scheme::Scalar: WithSmallOrderMulGroup<3> + FromUniformBytes<64>,
 {
+    // println!("params.n {:?}", params.n());
+    // println!("params.k {:?}", params.k());
+
+    // println!("num_instance_columns {:?}", vk.cs.num_instance_columns); // 1
+    // println!("num_advice_columns {:?}", vk.cs.num_advice_columns); // 9
+    // println!("num_fixed_columns {:?}", vk.cs.num_fixed_columns); // 21
     // Check that instances matches the expected number of instance columns
     for instances in instances.iter() {
         if instances.len() != vk.cs.num_instance_columns {
@@ -648,6 +654,11 @@ where
     let advice_evals = (0..num_proofs)
         .map(|_| -> Result<Vec<_>, _> { read_n_scalars(transcript, vk.cs.advice_queries.len()) })
         .collect::<Result<Vec<_>, _>>()?;
+    // println!("vk.cs.advice_queries.len {:?}", vk.cs.advice_queries.len());
+    // println!("advice_evals.len {:?}", advice_evals.len());
+    // println!("advice_evals0.len {:?}", advice_evals[0].len());
+    // println!("--------------------------------------------------------");
+
     return Ok((*x, advice_evals[0][1]));
     // println!("verifier x: {:?}", *x);
     // println!("verfier eval: {:?}", advice_evals[0][1]);
